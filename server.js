@@ -4,127 +4,138 @@ const express = require('express');
 const axios = require('axios');
 const bodyParser = require('body-parser');
 const admin = require('firebase-admin');
+const path = require('path');
 
-// Firestore Init
+// Firebase setup
 const serviceAccount = require('./serviceAccountKey.json');
 admin.initializeApp({ credential: admin.credential.cert(serviceAccount) });
 const db = admin.firestore();
 
 const app = express();
 app.use(bodyParser.json());
-const path = require('path');
 
-app.get('/', (req, res) => {
-  res.sendFile(path.join(__dirname, 'index.html'));
-});
-
-
+// ENV Variables
 const {
   PORT = 3000,
   APP_ID,
   APP_SECRET,
-  VERIFY_TOKEN
+  VERIFY_TOKEN,
+  REDIRECT_URI
 } = process.env;
 
-// Webhook Verification
+// === Serve Frontend ===
+app.get('/', (req, res) => {
+  res.sendFile(path.join(__dirname, 'index.html'));
+});
+
+// === Webhook Verification ===
 app.get('/webhook', (req, res) => {
   const mode = req.query['hub.mode'];
   const token = req.query['hub.verify_token'];
   const challenge = req.query['hub.challenge'];
+
   if (mode === 'subscribe' && token === VERIFY_TOKEN) {
     return res.status(200).send(challenge);
   }
-  res.sendStatus(403);
+  return res.sendStatus(403);
 });
 
-// Webhook Listener
+// === Webhook Listener ===
 app.post('/webhook', (req, res) => {
-  console.log('Webhook Received:', JSON.stringify(req.body, null, 2));
+  console.log('📩 Webhook Payload Received:', JSON.stringify(req.body, null, 2));
   res.sendStatus(200);
 });
 
-// OAuth Callback Handler
+// === OAuth Callback Handler (after embedded signup) ===
 app.get('/oauth/callback', async (req, res) => {
-  const { code, waba_id, phone_number_id } = req.query;
-  if (!code) return res.status(400).send('Missing code');
+  const { code } = req.query;
+
+  if (!code) {
+    return res.status(400).send('❌ Missing code from query.');
+  }
 
   try {
-    // Step 1: Exchange code for token
-    const tokenResp = await axios.get('https://graph.facebook.com/v21.0/oauth/access_token', {
+    // STEP 1: Exchange Code for Access Token
+    const tokenRes = await axios.get(`https://graph.facebook.com/v21.0/oauth/access_token`, {
       params: {
         client_id: APP_ID,
         client_secret: APP_SECRET,
+        redirect_uri: REDIRECT_URI,
         code
       }
     });
 
-    const business_token = tokenResp.data.access_token;
+    const access_token = tokenRes.data.access_token;
 
-    // Step 2: Subscribe to webhooks on WABA
-    await axios.post(`https://graph.facebook.com/v23.0/${waba_id}/subscribed_apps`, {}, {
-      headers: { Authorization: `Bearer ${business_token}` }
+    // STEP 2: Get Business Info
+    const businessInfo = await axios.get(`https://graph.facebook.com/v21.0/me`, {
+      headers: { Authorization: `Bearer ${access_token}` }
     });
 
-    // Step 3: Store data in Firestore
+    const business_id = businessInfo.data.id;
+
+    // STEP 3: Get WABA Accounts
+    const wabasRes = await axios.get(`https://graph.facebook.com/v21.0/${business_id}/owned_whatsapp_business_accounts`, {
+      headers: { Authorization: `Bearer ${access_token}` }
+    });
+
+    const waba_id = wabasRes.data.data[0]?.id;
+
+    if (!waba_id) throw new Error('No WABA ID found');
+
+    // STEP 4: Get Phone Number ID
+    const phoneRes = await axios.get(`https://graph.facebook.com/v21.0/${waba_id}/phone_numbers`, {
+      headers: { Authorization: `Bearer ${access_token}` }
+    });
+
+    const phone_number_id = phoneRes.data.data[0]?.id;
+    if (!phone_number_id) throw new Error('No phone number found');
+
+    // STEP 5: Subscribe to Webhooks
+    await axios.post(`https://graph.facebook.com/v21.0/${waba_id}/subscribed_apps`, {}, {
+      headers: { Authorization: `Bearer ${access_token}` }
+    });
+
+    // STEP 6: Store in Firestore
     await db.collection('clients').doc(waba_id).set({
       waba_id,
       phone_number_id,
-      business_token,
+      access_token,
       onboarded_at: new Date()
     });
 
-    res.send('✅ Onboarding completed! Ask client to add payment method here: https://www.facebook.com/business/help/488291839463771');
+    return res.send(`✅ Onboarding complete. You may now use the WhatsApp Business API!`);
   } catch (err) {
-    console.error('OAuth Error:', err.response?.data || err.message);
-    res.status(500).send('Error during onboarding');
+    console.error('❌ Onboarding Error:', err.response?.data || err.message);
+    return res.status(500).send('❌ Error during onboarding');
   }
 });
 
-// Register Number with PIN
-app.post('/register-number', async (req, res) => {
-  const { waba_id, pin } = req.body;
-  try {
-    const doc = await db.collection('clients').doc(waba_id).get();
-    if (!doc.exists) return res.status(404).send('Client not found');
-    const { phone_number_id, business_token } = doc.data();
-
-    const response = await axios.post(`https://graph.facebook.com/v21.0/${phone_number_id}/register`, {
-      messaging_product: 'whatsapp',
-      pin
-    }, {
-      headers: { Authorization: `Bearer ${business_token}` }
-    });
-
-    res.json(response.data);
-  } catch (e) {
-    console.error('Register Error:', e.response?.data || e.message);
-    res.status(500).json(e.response?.data || e.message);
-  }
-});
-
-// Send Message
+// === Simple Send Message Endpoint ===
 app.post('/send-message', async (req, res) => {
   const { waba_id, to, body } = req.body;
+
   try {
     const doc = await db.collection('clients').doc(waba_id).get();
     if (!doc.exists) return res.status(404).send('Client not found');
-    const { phone_number_id, business_token } = doc.data();
 
-    const response = await axios.post(`https://graph.facebook.com/v21.0/${phone_number_id}/messages`, {
+    const { phone_number_id, access_token } = doc.data();
+
+    const result = await axios.post(`https://graph.facebook.com/v21.0/${phone_number_id}/messages`, {
       messaging_product: 'whatsapp',
-      recipient_type: 'individual',
       to,
       type: 'text',
       text: { body }
     }, {
-      headers: { Authorization: `Bearer ${business_token}` }
+      headers: { Authorization: `Bearer ${access_token}` }
     });
 
-    res.json(response.data);
-  } catch (e) {
-    console.error('Message Error:', e.response?.data || e.message);
-    res.status(500).json(e.response?.data || e.message);
+    return res.json(result.data);
+  } catch (err) {
+    console.error('❌ Message Error:', err.response?.data || err.message);
+    res.status(500).send('Error sending message');
   }
 });
 
-app.listen(PORT, () => console.log(`✅ Server live on port ${PORT}`));
+// === Start Server ===
+app.listen(PORT, () => console.log(`🚀 Server is running on http://localhost:${PORT}`));
